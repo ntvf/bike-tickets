@@ -24,14 +24,34 @@ fuzzy-matched (PL diacritics ok). Reads `--legs` or stdin.
 ```
 
 Flags: `--json` (machine output), `--direct` (direct only), `--all` (include
-no-bike connections), `--headless` (usually blocked).
+no-bike connections), `--verify` (live-check each bike connection, adds price),
+`--headless` (usually blocked).
 
 ## Output
 
-JSON list per leg with `connections[]`. A connection is bookable-with-bike when
+JSON list per leg with `connections[]`. A connection offers a bike when
 `bike_on_whole_route == true` and `presale_available == true`.
 
-`bike_offered` = bike places offered at search time (same signal the website
-shows), not a live free count. Exact count needs the reservation step
-(`sprawdzCenyLite`, not implemented). Unofficial endpoints — personal use,
-throttle. Headless server: `xvfb-run -a .venv/bin/python ic_bike.py ...`
+With `--verify`, each such connection also gets a live `sprawdzCenyLite` check:
+
+```jsonc
+"live": { "live_sellable": true, "seat_min_price_pln": 71.0, "message": "" },
+"bike_bookable": true   // bike offered AND connection live-sellable now
+```
+
+`live_sellable` = connection is purchasable right now (not sold out / withdrawn).
+
+## Bike availability — what you can and cannot know
+
+- `bike_offered` = bike transport **offered** on that train (search-step signal,
+  same as the website's bike icon).
+- `--verify` adds a **live** sellability check + seat price.
+- **No numeric free-bike count exists without login.** `sprawdzCenyLite` /
+  `sprawdzCene` return only *seat* offers, never the bike place type. The bike is
+  a flat 9.10 zł add-on whose capacity is enforced only at `wygenerujBilet` (the
+  authenticated endpoint, which actually reserves a spot). A hard "≥1 bike spot
+  free" guarantee therefore requires logging in and committing a reservation.
+  `--verify` is the strongest no-login signal.
+
+Unofficial endpoints — personal use, throttle.
+Headless server: `xvfb-run -a .venv/bin/python ic_bike.py ...`

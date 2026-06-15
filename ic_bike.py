@@ -23,11 +23,25 @@ page context via fetch() — no fragile DOM scraping. Methods used:
 
 Bike availability fidelity
 --------------------------
-`typyMiejsc` containing the bike code is the search-step signal that bike transport
-is offered/available on that train (a train with no bike capacity, e.g. EC "Chopin",
-omits it). For a hard guarantee that a bike place is still bookable right now, the
-e-IC flow would additionally call `sprawdzCenyLite` (reservation step); that is left
-as an enhancement — see check_bike_price() stub.
+Two signals, in increasing strength:
+
+1. search step (default): `typyMiejsc` contains the bike code (24) => the train
+   OFFERS bike transport (a train with no bike capacity, e.g. EC "Chopin", omits
+   it). Same signal the website shows as its bike icon.
+
+2. `--verify` (live): for each bike-offering connection, fire `sprawdzCenyLite`
+   (the e-IC reservation-step price call) on /Sprzedaz. A sold-out / withdrawn
+   connection returns empty `ceny` / non-zero `komunikatKod`; a live one returns
+   seat prices. So this confirms the connection is *purchasable right now* and
+   attaches the seat price. See EicClient.check_price_lite / _interpret_lite.
+
+Hard limit (important): PKP's public API exposes NO numeric free-bike count, and
+`sprawdzCenyLite`/`sprawdzCene` only ever return *seat* offers (rodzajMiejscaKod 1),
+never the bike place type. The bike is a flat-fee add-on (9.10 zł) whose capacity
+is checked only at `wygenerujBilet` — on the AUTHENTICATED endpoint, which actually
+reserves a spot (login required). So a true "one bike spot is free" guarantee is not
+obtainable without logging in and committing a reservation. `--verify` gives the
+strongest no-login signal: bike offered + connection live-sellable + presale open.
 
 Docker / headless servers (e.g. Intel N100)
 -------------------------------------------
@@ -152,6 +166,33 @@ class EicClient:
             return sorted(cands, key=lambda s: len(s["nazwa"]))[0]
         raise RuntimeError(f"station not found: {name!r}")
 
+    # ---- live verification ---------------------------------------------
+    def check_price_lite(self, conn):
+        """Live price/availability check for one connection (e-IC `sprawdzCenyLite`).
+
+        This is the reservation-step "lite" call the website fires after a
+        connection is picked. It re-validates the connection against live
+        inventory: a sold-out / withdrawn connection comes back with empty
+        `ceny`, a non-zero `komunikatKod`, or errors. Returns the raw RPC.
+        """
+        odcinki = [{
+            "wyjazdData": p.get("dataWyjazdu"),
+            "stacjaOdKod": p.get("stacjaWyjazdu"),
+            "stacjaDoKod": p.get("stacjaPrzyjazdu"),
+            "pociagNr": p.get("nrPociagu"),
+            "kategoriaPociagu": p.get("kategoriaPociagu"),
+        } for p in conn.get("pociagi", [])]
+        return self.rpc("/Sprzedaz", {
+            "metoda": "sprawdzCenyLite",
+            "jezyk": "PL",
+            "biletTyp": 1,            # SINGLE_DOMESTIC
+            "ofertyZaznaczone": [],
+            "polaczenia": [{"idPolaczenia": conn.get("idPolaczenia"), "odcinki": odcinki}],
+            "podrozni": [{"kodZakupowyZnizki": 1010}],  # 1010 = no discount (normal fare)
+            "wersja": "web_desktop",
+            "url": SITE,
+        })
+
     # ---- search ---------------------------------------------------------
     def search(self, from_kod, to_kod, date, direct=False):
         r = self.rpc("/Pociagi", {
@@ -172,7 +213,51 @@ class EicClient:
             self._pw.stop()
 
 
-def find_bike_connections(legs, direct=False, only_bike=True, headless=False):
+def _interpret_lite(resp):
+    """Turn a raw sprawdzCenyLite reply into a live-sellability verdict.
+
+    Note on fidelity: the public price call only ever returns *seat* offers
+    (rodzajMiejscaKod 1) -- it never enumerates bike places, and PKP exposes no
+    numeric free-bike count without logging in and generating a ticket (the
+    `wygenerujBilet` step on the authenticated endpoint, which actually reserves
+    a spot). So `live_sellable` means "this connection is purchasable right now"
+    (not sold out / withdrawn). A bookable seat is necessary -- though not by
+    itself sufficient -- for adding a bike, which is a flat-fee add-on.
+    """
+    verdict = {"live_checked": True, "live_sellable": False,
+               "seat_min_price_pln": None, "message": ""}
+    if resp.get("bledy"):
+        verdict["message"] = _first_msg(resp["bledy"])
+        return verdict
+    cp = resp.get("cenyPolaczen") or []
+    if not cp:
+        verdict["message"] = "no offer returned"
+        return verdict
+    entry = cp[0]
+    if entry.get("bledy"):
+        verdict["message"] = _first_msg(entry["bledy"])
+        return verdict
+    sellable = [c for c in entry.get("ceny", [])
+                if c.get("komunikatKod", 0) == 0 and not c.get("blad", False)]
+    if sellable:
+        verdict["live_sellable"] = True
+        verdict["seat_min_price_pln"] = min(c["cena"] for c in sellable) / 100
+    else:
+        verdict["message"] = "no sellable offer (sold out or unavailable)"
+    return verdict
+
+
+def _first_msg(bledy):
+    try:
+        for o in bledy[0].get("opisy", []):
+            if o.get("jezyk") == "EN":
+                return o.get("komunikat", "")
+        return bledy[0].get("opisy", [{}])[0].get("komunikat", "")
+    except Exception:
+        return "error"
+
+
+def find_bike_connections(legs, direct=False, only_bike=True, headless=False, verify=False):
     cli = EicClient(headless=headless)
     bike = cli.bike_code()
     out = []
@@ -197,7 +282,7 @@ def find_bike_connections(legs, direct=False, only_bike=True, headless=False):
                 bike_ok = all(x["bike_offered"] for x in trains) and trains
                 if only_bike and not bike_ok:
                     continue
-                leg_out["connections"].append({
+                conn_out = {
                     "departure": c.get("dataWyjazdu"),
                     "arrival": c.get("dataPrzyjazdu"),
                     "duration_min": c.get("czasJazdy"),
@@ -205,7 +290,18 @@ def find_bike_connections(legs, direct=False, only_bike=True, headless=False):
                     "presale_available": c.get("dostepneWPrzedsprzedazy"),
                     "bike_on_whole_route": bool(bike_ok),
                     "trains": trains,
-                })
+                }
+                # Live verification: only worth doing for bike-offering
+                # connections that are presale-open.
+                if verify and bike_ok and c.get("dostepneWPrzedsprzedazy"):
+                    try:
+                        verdict = _interpret_lite(cli.check_price_lite(c))
+                    except Exception as e:
+                        verdict = {"live_checked": True, "live_sellable": False,
+                                   "seat_min_price_pln": None, "message": str(e)}
+                    conn_out["live"] = verdict
+                    conn_out["bike_bookable"] = bool(bike_ok and verdict["live_sellable"])
+                leg_out["connections"].append(conn_out)
             out.append(leg_out)
     finally:
         cli.close()
@@ -222,8 +318,15 @@ def _print_human(results):
             trains = ", ".join(f"{t['category']} {t['number']}"
                                + (f" {t['name']}" if t['name'] else "") for t in c["trains"])
             flag = "BIKE OK" if c["bike_on_whole_route"] else "partial"
+            live = ""
+            if "live" in c:
+                v = c["live"]
+                if v["live_sellable"]:
+                    live = f" | LIVE sellable, seat from {v['seat_min_price_pln']:.2f} zl"
+                else:
+                    live = f" | LIVE not sellable ({v['message']})"
             print(f"  [{c['departure']} -> {c['arrival']}] {c['duration_min']}min "
-                  f"changes={c['changes']} {flag}: {trains}")
+                  f"changes={c['changes']} {flag}: {trains}{live}")
 
 
 def main():
@@ -232,6 +335,9 @@ def main():
     ap.add_argument("--direct", action="store_true", help="direct connections only")
     ap.add_argument("--all", action="store_true", help="show all connections, not only bike ones")
     ap.add_argument("--headless", action="store_true", help="try headless (usually blocked by Akamai)")
+    ap.add_argument("--verify", action="store_true",
+                    help="live-check each bike connection via sprawdzCenyLite "
+                         "(confirms it is sellable now; adds price). No bike free-count exists w/o login.")
     ap.add_argument("--json", action="store_true", help="emit JSON")
     args = ap.parse_args()
 
@@ -240,7 +346,8 @@ def main():
         legs = [legs]
 
     results = find_bike_connections(legs, direct=args.direct,
-                                    only_bike=not args.all, headless=args.headless)
+                                    only_bike=not args.all, headless=args.headless,
+                                    verify=args.verify)
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
     else:
